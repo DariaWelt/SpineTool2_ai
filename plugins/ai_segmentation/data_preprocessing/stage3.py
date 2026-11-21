@@ -11,6 +11,7 @@ from multiprocessing import Pool, cpu_count
 from tifffile import imread
 from scipy.ndimage import gaussian_filter, rotate
 from skimage.measure import label
+from data_preprocessing.stage3_targets import build_local_targets
 
 from data_preprocessing.stage1 import normalize_minmax
 from data_preprocessing.stage2 import calculate_interim_image, find_optimal_j0, calculate_isi
@@ -92,7 +93,7 @@ def get_fragment(image, start_pos):
 
     return patch, borders
 
-def split_and_save(img_c, l1_s, l2_s, isi_s, mask, name, angle, start_pos, output_dir):
+def split_and_save(img_c, l1_s, l2_s, isi_s, mask, name, angle, start_pos, output_dir, local_maps):
     frag_z, frag_y, frag_x = FRAGMENT_SHAPE
     z_count = max(1, int(np.ceil((img_c.shape[0] - start_pos[0]) / frag_z)))
     y_count = max(1, int(np.ceil((img_c.shape[1] - start_pos[1]) / frag_y)))
@@ -125,11 +126,13 @@ def split_and_save(img_c, l1_s, l2_s, isi_s, mask, name, angle, start_pos, outpu
                 
                 fname = f"{name}_a{angle}_p{start_pos[0]}{start_pos[1]}{start_pos[2]}_idx{k}-{j}-{i}.npz"
                 save_path = os.path.join(output_dir, fname)
-                np.savez_compressed(save_path, image=full_tensor, mask=p_mask_crop, borders=borders)
+                aux = {key: get_fragment(value, curr_pos)[0] for key, value in local_maps.items()}
+                np.savez_compressed(save_path, image=full_tensor, mask=p_mask_crop,
+                                    borders=borders, stage3_format_version=np.int32(2), **aux)
                 saved_count += 1
     return saved_count
 
-def process_item(item, output_dir, is_train_mode, base_path, preds_stage1_dir, preds_stage2_dir):
+def process_item(item, output_dir, is_train_mode, base_path, preds_stage1_dir, preds_stage2_dir, spine_radius_um=0.3, neck_radius_um=0.15):
     np.random.seed(); random.seed()
     name = item['name']
     volume_output_dir = os.path.join(output_dir, name)
@@ -178,14 +181,14 @@ def process_item(item, output_dir, is_train_mode, base_path, preds_stage1_dir, p
     l2_up = scale_to_shape(l2_raw, target_high_res_shape)
     isi_up = scale_to_shape(I_si, target_high_res_shape)
     l1_s = apply_gaussian_3d_stack(l1_up, sigma=2.0)
-    l2_s = apply_gaussian_3d_stack(l2_up, sigma=2.0)
+    l2_s = l2_up.astype(np.float32)  # Preserve thin stage2 neck probabilities.
     isi_s = apply_gaussian_3d_stack(isi_up, sigma=2.0)
 
     I_norm = normalize_minmax(raw_img)
 
     # 5. Загрузка масок
     g_path = resolve(item.get('general_mask'))
-    s_path = resolve(item.get('spines_mask'))
+    s_path = resolve(item.get('spine_mask') or item.get('spines_mask'))
     h_path = resolve(item.get('shaft_mask'))
 
     mask = None
@@ -194,8 +197,18 @@ def process_item(item, output_dir, is_train_mode, base_path, preds_stage1_dir, p
         s_mask, h_mask = imread(s_path), imread(h_path)
         mask = np.maximum(s_mask, h_mask) 
 
-    if area is not None: mask = mask * area
-    mask[mask > 0] = 1
+    if mask is None:
+        raise ValueError(f"{name}: general_mask or spine_mask + shaft_mask required")
+    if not s_path or not h_path or not os.path.exists(s_path) or not os.path.exists(h_path):
+        raise ValueError(f"{name}: manual spine_mask (or spines_mask) and shaft_mask required")
+    spine, shaft = imread(s_path) > 0, imread(h_path) > 0
+    if mask.shape != raw_img.shape or spine.shape != raw_img.shape or shaft.shape != raw_img.shape:
+        raise ValueError(f"{name}: manual masks must match the original image shape")
+    valid = np.ones(raw_img.shape, dtype=np.uint8) if area is None else area
+    mask = ((mask > 0) & (valid > 0)).astype(np.uint8)
+    local_maps = build_local_targets(mask, spine & (valid > 0), shaft & (valid > 0),
+                                     scale, spine_radius_um, neck_radius_um)
+    local_maps['valid_mask'] = valid.astype(np.uint8)
 
     # 6. Паддинг
     I_s = pad_to_min_shape(I_norm)
@@ -203,6 +216,7 @@ def process_item(item, output_dir, is_train_mode, base_path, preds_stage1_dir, p
     l2_s = pad_to_min_shape(l2_s)
     isi_s = pad_to_min_shape(isi_s)
     mask = pad_to_min_shape(mask)
+    local_maps = {key: pad_to_min_shape(value) for key, value in local_maps.items()}
 
     # 7. Нарезка и Аугментация
     angles = random.sample(ANGLES_POOL, ANGLES_COUNT_TRAIN) if is_train_mode else [0]
@@ -218,9 +232,13 @@ def process_item(item, output_dir, is_train_mode, base_path, preds_stage1_dir, p
         else:
             img_rot, l1_rot, l2_rot, isi_rot, mask_rot = I_s, l1_s, l2_s, isi_s, mask
             
+        # Rotate precomputed full-volume skeleton/regions together with GT, not per tile.
+        maps_rot = {key: rotate(value, angle, axes=(2, 1), reshape=True, order=0,
+                                prefilter=False) if angle != 0 else value
+                    for key, value in local_maps.items()}
         for pos in POSITIONS:
             if not is_train_mode and pos != [0,0,0]: continue
-            saved = split_and_save(img_rot, l1_rot, l2_rot, isi_rot, mask_rot, name, angle, pos, volume_output_dir)
+            saved = split_and_save(img_rot, l1_rot, l2_rot, isi_rot, mask_rot, name, angle, pos, volume_output_dir, maps_rot)
             total_saved += saved
             
     return total_saved
@@ -234,6 +252,10 @@ if __name__ == "__main__":
     parser.add_argument("--mode", required=True, choices=["train", "val", "test"])
     parser.add_argument("--base_path", default="../../")
     parser.add_argument("--workers", type=int, default=cpu_count()) 
+    parser.add_argument('--spine_radius_um', type=float, default=0.3)
+    parser.add_argument('--neck_radius_um', type=float, default=0.15)
+    parser.add_argument('--local_masks_json', help='Stage4 JSON with manual spine_mask and shaft_mask, matched by name')
+    parser.add_argument('--local_masks_base_path', help='Base directory for paths in local_masks_json; defaults to base_path')
     args = parser.parse_args()
     
     final_output_dir = os.path.join(args.out_dir, args.mode)
@@ -241,6 +263,16 @@ if __name__ == "__main__":
     random.seed(42)
     
     with open(args.json_path) as f: cfg = json.load(f)
+    if args.local_masks_json:
+        with open(args.local_masks_json) as f:
+            local_cfg = json.load(f)
+        local_items = {entry['name']: entry for entry in local_cfg['data']}
+        local_base = args.local_masks_base_path or args.base_path
+        for entry in cfg['data']:
+            local_entry = local_items.get(entry['name'], {})
+            for key in ('spine_mask', 'spines_mask', 'shaft_mask'):
+                if local_entry.get(key):
+                    entry[key] = os.path.abspath(os.path.join(local_base, local_entry[key]))
     items = []
     ts, vs = set(cfg.get('test_data', [])), set(cfg.get('validation_data', []))
     for x in cfg['data']:
@@ -256,7 +288,8 @@ if __name__ == "__main__":
         is_train_mode=(args.mode == 'train'), 
         base_path=args.base_path,
         preds_stage1_dir=args.l1_dir,
-        preds_stage2_dir=args.l2_dir
+        preds_stage2_dir=args.l2_dir,
+        spine_radius_um=args.spine_radius_um, neck_radius_um=args.neck_radius_um
     )
     
     total_patches = 0

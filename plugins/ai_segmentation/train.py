@@ -26,11 +26,19 @@ def main(cfg: DictConfig):
         auto_insert_metric_name=False
     )
     
-    checkpoint_last = ModelCheckpoint(
-        dirpath=cfg.paths.checkpoint_dir,
-        save_last=True,
-        save_top_k=0,
-    )
+    callbacks = [checkpoint]
+    # Stage3 keeps independent rankings: loss for historical comparisons,
+    # Dice for selecting segmentation quality on validation data.
+    if cfg.model._target_ == "src.models.stage3_module.Stage3SegmentationModule":
+        callbacks.append(ModelCheckpoint(
+            dirpath=cfg.paths.checkpoint_dir,
+            monitor="val/dice",
+            mode="max",
+            save_top_k=2,
+            save_last=False,
+            filename="epoch={epoch:02d}-val_dice={val/dice:.4f}",
+            auto_insert_metric_name=False,
+        ))
     logger = TensorBoardLogger(cfg.paths.log_dir, 
         name="folds",
         version=f"fold_{cfg.paths.fold}")
@@ -38,12 +46,14 @@ def main(cfg: DictConfig):
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
     # 3. Init Trainer
     trainer = pl.Trainer(
-        logger=logger, callbacks=[checkpoint, checkpoint_last, lr_monitor],
+        logger=logger, callbacks=[*callbacks, lr_monitor],
         max_epochs=cfg.trainer.max_epochs,
         accelerator=cfg.trainer.accelerator,
-        # devices=cfg.trainer.devices,#stage3
-        # accumulate_grad_batches=cfg.trainer.accumulate_grad_batches,#stage3
-        # precision=cfg.trainer.precision#stage3
+        devices=cfg.trainer.get('devices', 'auto'),
+        accumulate_grad_batches=cfg.trainer.get('accumulate_grad_batches', 1),
+        precision=cfg.trainer.get('precision', '32-true'),
+        gradient_clip_val=cfg.trainer.get('gradient_clip_val', None),
+
     )
     # 4. Train
     trainer.fit(model=model, datamodule=datamodule)

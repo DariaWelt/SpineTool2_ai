@@ -63,7 +63,7 @@ class Stage3DataModule(pl.LightningDataModule):
 				area_path=self.hparams.area_path,
 				patch_size=self.hparams.patch_size,
 				overlap=self.hparams.overlap,
-				sigma=1.0
+				sigma=2.0
 			)
 
 	def train_dataloader(self):

@@ -31,13 +31,19 @@ model:
   in_ch: 4
   out_ch: 1
   init_features: 64
-  lr: 0.005
+  lr: 0.0003
+  dice_weight: 0.4
+  bce_weight: 0.4
+  skeleton_weight: 0.2
+  spine_error_weight: 2.0
+  neck_error_weight: 3.0
 
 
 trainer:
   _target_: pytorch_lightning.Trainer
   precision: "bf16-mixed"
   accumulate_grad_batches: 4
+  gradient_clip_val: 1.0
   max_epochs: 20
   accelerator: "gpu"
   devices: 1

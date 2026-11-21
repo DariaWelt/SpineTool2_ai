@@ -10,161 +10,160 @@ from data_preprocessing.stage1 import normalize_minmax
 from data_preprocessing.stage3 import scale_to_shape, apply_gaussian_3d_stack
 
 class Stage3TrainDataset(Dataset):
-	"""
-	Датасет для обучения. Ожидает список словарей с путями к файлам.
-	"""
+    """
+    Датасет для обучения. Ожидает список словарей с путями к файлам.
+    """
 
-	def __init__(self, data_dir):
-		search_path = os.path.join(data_dir, "**", "*.npz")
-		self.files = glob.glob(search_path, recursive=True)
-		if not self.files:
-			print(f"Warning: No files found in {data_dir}")
+    def __init__(self, data_dir):
+        search_path = os.path.join(data_dir, "**", "*.npz")
+        self.files = glob.glob(search_path, recursive=True)
+        if not self.files:
+            print(f"Warning: No files found in {data_dir}")
 
-	def __len__(self):
-		return len(self.files)
+    def __len__(self):
+        return len(self.files)
 
-	def __getitem__(self, idx):
-		# Загружаем сжатый файл
-		# allow_pickle=True нужен для безопасности numpy, для npz это ок
-		data = np.load(self.files[idx], allow_pickle=True)
+    def __getitem__(self, idx):
+        with np.load(self.files[idx], allow_pickle=False) as data:
+            required = ('spine_roi', 'neck_roi', 'local_skeleton', 'valid_mask')
+            if int(data.get('stage3_format_version', 0)) != 2 or any(k not in data for k in required):
+                raise ValueError(f"{self.files[idx]}: regenerate stage3 NPZ with data_preprocessing.stage3 "
+                                 "(raw stage2 channel and manual local targets required)")
+            result = {
+                'image': torch.from_numpy(data['image'].astype(np.float32)),
+                'mask': torch.from_numpy(data['mask'].astype(np.float32)).unsqueeze(0),
+                'borders': torch.from_numpy(data['borders'].astype(np.int64)),
+            }
+            for key in required:
+                result[key] = torch.from_numpy(data[key].astype(np.float32)).unsqueeze(0)
+            return result
 
-		# Данные уже имеют форму [4, 64, 128, 128] и тип float32
-		image = torch.from_numpy(data['image'])
-
-		# Маска имеет форму [64, 128, 128], добавляем канал -> [1, 64, 128, 128]
-		mask = torch.from_numpy(data['mask']).float().unsqueeze(0)
-		borders = torch.from_numpy(data['borders']).long()
-		return {
-			"image": image,
-			"mask": mask,
-			"borders": borders
-		}
 
 
 class Stage3InferenceDataset(Dataset):
-	"""
-	Датасет "Скользящее окно" для инференса больших Tiff файлов.
-	"""
+    """
+    Датасет "Скользящее окно" для инференса больших Tiff файлов.
+    """
 
-	def __init__(self, tiff_path, current_scale, l_dendrite_path, necks_path, area_path=None, patch_size=(64, 128, 128), overlap=(32, 64, 64), sigma=1.0):
-		self.patch_size = np.array(patch_size)
-		self.overlap = np.array(overlap)
-		self.stride = (self.patch_size - self.overlap).astype(int)
+    def __init__(self, tiff_path, current_scale, l_dendrite_path, necks_path, area_path=None, patch_size=(64, 128, 128), overlap=(32, 64, 64), sigma=2.0):
+        self.patch_size = np.array(patch_size)
+        self.overlap = np.array(overlap)
+        self.stride = (self.patch_size - self.overlap).astype(int)
 
-		# 1. Загрузка
-		raw_img = imread(tiff_path).astype(np.float32)
-		self.area_mask = None
+        # 1. Загрузка
+        raw_img = imread(tiff_path).astype(np.float32)
+        self.area_mask = None
 
-		if area_path and os.path.exists(area_path):
-			area = imread(area_path)
-			if raw_img.shape == area.shape:
-				self.area_mask = area > 0
-				raw_img = raw_img * self.area_mask
-			else:
-				print(f"Shape mismatch {raw_img.shape} vs {area.shape}")
+        if area_path and os.path.exists(area_path):
+            area = imread(area_path)
+            if raw_img.shape == area.shape:
+                self.area_mask = area > 0
+                raw_img = raw_img * self.area_mask
+            else:
+                print(f"Shape mismatch {raw_img.shape} vs {area.shape}")
 
-		self.shape = raw_img.shape
+        self.shape = raw_img.shape
 
-		l1_raw = imread(l_dendrite_path)
-		l2_raw = imread(necks_path)
+        l1_raw = imread(l_dendrite_path)
+        l2_raw = imread(necks_path)
 
-		i_interim = calculate_interim_image(raw_img, current_scale)
-		l1_bin = (l1_raw > 0.5).astype(np.uint8)
-		j0 = find_optimal_j0(i_interim, l1_bin)
-		I_si = calculate_isi(i_interim, j0)
-		
-		l1_up = scale_to_shape(l1_raw, self.shape)
-		l2_up = scale_to_shape(l2_raw, self.shape)
-		isi_up = scale_to_shape(I_si, self.shape)
-		l1_s = apply_gaussian_3d_stack(l1_up, sigma=1.0)
-		l2_s = apply_gaussian_3d_stack(l2_up, sigma=1.0)
-		isi_s = apply_gaussian_3d_stack(isi_up, sigma=1.0)
+        i_interim = calculate_interim_image(raw_img, current_scale)
+        l1_bin = (l1_raw > 0.5).astype(np.uint8)
+        j0 = find_optimal_j0(i_interim, l1_bin)
+        I_si = calculate_isi(i_interim, j0)
 
-		I_norm = normalize_minmax(raw_img)
-	
-		# Сохраняем предобработанные карты в памяти
-		self.I_norm = I_norm
-		self.L1_s = l1_s
-		self.L2_s = l2_s
-		self.I_si_s = isi_s
+        l1_up = scale_to_shape(l1_raw, self.shape)
+        l2_up = scale_to_shape(l2_raw, self.shape)
+        isi_up = scale_to_shape(I_si, self.shape)
+        l1_s = apply_gaussian_3d_stack(l1_up, sigma=sigma)
+        l2_s = l2_up.astype(np.float32)  # No Gaussian smoothing for stage2.
+        isi_s = apply_gaussian_3d_stack(isi_up, sigma=sigma)
 
-		# Генерация сетки координат
-		self.coords = self._generate_grid()
+        I_norm = normalize_minmax(raw_img)
 
-	def _generate_grid(self):
-		coords = []
-		z_steps = range(0, self.shape[0], self.stride[0])
-		y_steps = range(0, self.shape[1], self.stride[1])
-		x_steps = range(0, self.shape[2], self.stride[2])
-		dz, dy, dx = self.patch_size
-		for z in z_steps:
-			for y in y_steps:
-				for x in x_steps:
-					if self.area_mask is not None:
-						area_patch = self.area_mask[
-							z:min(z + dz, self.shape[0]),
-							y:min(y + dy, self.shape[1]),
-							x:min(x + dx, self.shape[2]),
-						]
-						if not np.any(area_patch):
-							continue
-					coords.append((z, y, x))
-		return coords
+        # Сохраняем предобработанные карты в памяти
+        self.I_norm = I_norm
+        self.L1_s = l1_s
+        self.L2_s = l2_s
+        self.I_si_s = isi_s
 
-	def __pad_chunk(self, chunk):
-		"""
-		Дополняет кусок нулями до self.patch_size, если он меньше.
-		"""
+        # Генерация сетки координат
+        self.coords = self._generate_grid()
+
+    def _generate_grid(self):
+        coords = []
+        z_steps = range(0, self.shape[0], self.stride[0])
+        y_steps = range(0, self.shape[1], self.stride[1])
+        x_steps = range(0, self.shape[2], self.stride[2])
+        dz, dy, dx = self.patch_size
+        for z in z_steps:
+            for y in y_steps:
+                for x in x_steps:
+                    if self.area_mask is not None:
+                        area_patch = self.area_mask[
+                            z:min(z + dz, self.shape[0]),
+                            y:min(y + dy, self.shape[1]),
+                            x:min(x + dx, self.shape[2]),
+                        ]
+                        if not np.any(area_patch):
+                            continue
+                    coords.append((z, y, x))
+        return coords
+
+    def __pad_chunk(self, chunk):
+        """
+        Дополняет кусок нулями до self.patch_size, если он меньше.
+        """
         # Текущий размер куска
-		cz, cy, cx = chunk.shape
-		dz, dy, dx = self.patch_size
-        
+        cz, cy, cx = chunk.shape
+        dz, dy, dx = self.patch_size
+
         # Если размер совпадает, возвращаем как есть
-		if cz == dz and cy == dy and cx == dx:
-			return chunk
-            
+        if cz == dz and cy == dy and cx == dx:
+            return chunk
+
         # Вычисляем сколько не хватает
-		pad_z = dz - cz
-		pad_y = dy - cy
-		pad_x = dx - cx
-        
+        pad_z = dz - cz
+        pad_y = dy - cy
+        pad_x = dx - cx
+
         # Делаем паддинг константой (0) справа/снизу
         # format: ((before, after), ...)
-		return np.pad(chunk, ((0, pad_z), (0, pad_y), (0, pad_x)), mode='constant', constant_values=0)
+        return np.pad(chunk, ((0, pad_z), (0, pad_y), (0, pad_x)), mode='constant', constant_values=0)
 
-	def __len__(self):
-		return len(self.coords)
+    def __len__(self):
+        return len(self.coords)
 
-	def __getitem__(self, idx):
-		z, y, x = self.coords[idx]
-		dz, dy, dx = self.patch_size
+    def __getitem__(self, idx):
+        z, y, x = self.coords[idx]
+        dz, dy, dx = self.patch_size
 
-		z_end = min(z + dz, self.shape[0])
-		y_end = min(y + dy, self.shape[1])
-		x_end = min(x + dx, self.shape[2])
+        z_end = min(z + dz, self.shape[0])
+        y_end = min(y + dy, self.shape[1])
+        x_end = min(x + dx, self.shape[2])
 
-		valid_z = z_end - z
-		valid_y = y_end - y
-		valid_x = x_end - x	
+        valid_z = z_end - z
+        valid_y = y_end - y
+        valid_x = x_end - x
 
-		# Вырезаем куски
-		p_I_norm = self.I_norm[z:z_end, y:y_end, x:x_end]
-		p_l1_s = self.L1_s[z:z_end, y:y_end, x:x_end]
-		p_l2_s = self.L2_s[z:z_end, y:y_end, x:x_end]
-		p_isi_s = self.I_si_s[z:z_end, y:y_end, x:x_end]
+        # Вырезаем куски
+        p_I_norm = self.I_norm[z:z_end, y:y_end, x:x_end]
+        p_l1_s = self.L1_s[z:z_end, y:y_end, x:x_end]
+        p_l2_s = self.L2_s[z:z_end, y:y_end, x:x_end]
+        p_isi_s = self.I_si_s[z:z_end, y:y_end, x:x_end]
 
-		# Дополняем до 64x64x64, если кусок обрезан
-		p_I_norm = self.__pad_chunk(p_I_norm)
-		p_l1_s = self.__pad_chunk(p_l1_s)
-		p_l2_s = self.__pad_chunk(p_l2_s)
-		p_isi_s = self.__pad_chunk(p_isi_s)
+        # Дополняем до 64x64x64, если кусок обрезан
+        p_I_norm = self.__pad_chunk(p_I_norm)
+        p_l1_s = self.__pad_chunk(p_l1_s)
+        p_l2_s = self.__pad_chunk(p_l2_s)
+        p_isi_s = self.__pad_chunk(p_isi_s)
 
-		# Сборка каналов
+        # Сборка каналов
 
-		input_tensor = np.stack([p_I_norm, p_isi_s, p_l1_s, p_l2_s], axis=0).astype(np.float32)
+        input_tensor = np.stack([p_I_norm, p_isi_s, p_l1_s, p_l2_s], axis=0).astype(np.float32)
 
-		return {
-			"image": torch.from_numpy(input_tensor),
-			"coords": torch.tensor([z, y, x]),
-			"valid_shape": torch.tensor([valid_z, valid_y, valid_x])
-		}
+        return {
+            "image": torch.from_numpy(input_tensor),
+            "coords": torch.tensor([z, y, x]),
+            "valid_shape": torch.tensor([valid_z, valid_y, valid_x])
+        }
