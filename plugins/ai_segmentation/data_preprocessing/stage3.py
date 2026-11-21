@@ -9,8 +9,8 @@ from functools import partial
 from multiprocessing import Pool, cpu_count
 
 from tifffile import imread
-from scipy.ndimage import gaussian_filter, rotate
-from skimage.measure import label
+from scipy.ndimage import gaussian_filter
+from data_preprocessing.stage3_patches import foreground_crop, rotation_geometry, rotated_fragment
 from data_preprocessing.stage3_targets import build_local_targets
 
 from data_preprocessing.stage1 import normalize_minmax
@@ -93,155 +93,145 @@ def get_fragment(image, start_pos):
 
     return patch, borders
 
-def split_and_save(img_c, l1_s, l2_s, isi_s, mask, name, angle, start_pos, output_dir, local_maps):
-    frag_z, frag_y, frag_x = FRAGMENT_SHAPE
-    z_count = max(1, int(np.ceil((img_c.shape[0] - start_pos[0]) / frag_z)))
-    y_count = max(1, int(np.ceil((img_c.shape[1] - start_pos[1]) / frag_y)))
-    x_count = max(1, int(np.ceil((img_c.shape[2] - start_pos[2]) / frag_x)))
-
+def split_and_save(img_c, l1_s, l2_s, isi_s, mask, name, angle, start_pos,
+                   output_dir, local_maps, crop_origin=(0, 0, 0)):
+    geometry = rotation_geometry(mask.shape, angle)
+    counts = np.maximum(1, np.ceil((np.asarray(geometry[0]) - start_pos) / FRAGMENT_SHAPE).astype(int))
     saved_count = 0
-    for k in range(z_count):
-        for j in range(y_count):
-            for i in range(x_count):
-                curr_pos = [start_pos[0] + k*frag_z, start_pos[1] + j*frag_y, start_pos[2] + i*frag_x]
-                
-                p_mask_crop, borders = get_fragment(mask, curr_pos)
-                if borders is None: continue 
-                
-                # Порог валидности патча (можно подкрутить, если шипики очень мелкие)
-                if np.sum(p_mask_crop) < 100: continue 
-                
-                p_img_crop, _ = get_fragment(img_c, curr_pos)
-                p_l1_crop, _ = get_fragment(l1_s, curr_pos)
-                p_l2_crop, _ = get_fragment(l2_s, curr_pos)
-                p_isi_crop, _ = get_fragment(isi_s, curr_pos)
-                
-                # --- Сборка 4 каналов по статье ---
-                ch1 = p_img_crop                   # ||I||p'
-                ch2 = p_isi_crop                   # I_si,s p'
-                ch3 = p_l1_crop                    # L1,s p'
-                ch4 = p_l2_crop                    # L2,s p'
-                
-                full_tensor = np.stack([ch1, ch2, ch3, ch4], axis=0).astype(np.float32)
-                
+    for k in range(counts[0]):
+        for j in range(counts[1]):
+            for i in range(counts[2]):
+                position = np.asarray(start_pos) + np.array([k, j, i]) * FRAGMENT_SHAPE
+                if angle == 0:
+                    extract = lambda volume, order: get_fragment(volume, position)
+                else:
+                    extract = lambda volume, order: rotated_fragment(volume, position, FINAL_SHAPE, geometry, order)
+                target, borders = extract(mask, 0)
+                if borders is None or np.sum(target) < 100:
+                    continue
+                # Only accepted tiles allocate intensity channels and auxiliary maps.
+                image = np.empty((4, *FINAL_SHAPE), dtype=np.float32)
+                for channel, volume in enumerate((img_c, isi_s, l1_s, l2_s)):
+                    image[channel] = extract(volume, 1)[0]
+                aux = {key: extract(value, 0)[0] for key, value in local_maps.items()}
                 fname = f"{name}_a{angle}_p{start_pos[0]}{start_pos[1]}{start_pos[2]}_idx{k}-{j}-{i}.npz"
-                save_path = os.path.join(output_dir, fname)
-                aux = {key: get_fragment(value, curr_pos)[0] for key, value in local_maps.items()}
-                np.savez_compressed(save_path, image=full_tensor, mask=p_mask_crop,
-                                    borders=borders, stage3_format_version=np.int32(2), **aux)
+                np.savez_compressed(os.path.join(output_dir, fname), image=image, mask=target,
+                                    borders=borders, stage3_format_version=np.int32(2),
+                                    crop_origin=np.asarray(crop_origin, dtype=np.int32), **aux)
                 saved_count += 1
+                del image, aux, target
     return saved_count
 
-def process_item(item, output_dir, is_train_mode, base_path, preds_stage1_dir, preds_stage2_dir, spine_radius_um=0.3, neck_radius_um=0.15):
+
+def process_item(item, output_dir, is_train_mode, base_path, preds_stage1_dir,
+                 preds_stage2_dir, spine_radius_um=0.3, neck_radius_um=0.15):
     np.random.seed(); random.seed()
     name = item['name']
     volume_output_dir = os.path.join(output_dir, name)
     os.makedirs(volume_output_dir, exist_ok=True)
 
-    def resolve(p): 
-        if p is None: return None
-        return os.path.normpath(os.path.join(base_path, p))
-    
-    # 1. Загрузка исходников
-    area_path = resolve(item.get('area_of_interest'))
-    area = None
-    if area_path and os.path.exists(area_path):
-        area = imread(area_path).astype(np.uint8)
-        area[area > 0] = 1
-        
-    img_path = resolve(item.get('image'))
-    if not img_path or not os.path.exists(img_path): return 0
-    raw_img = imread(img_path)
-    if area is not None: raw_img = raw_img * area
+    def resolve(path):
+        return os.path.normpath(os.path.join(base_path, path)) if path else None
 
-    # 2. Загрузка предсказаний L1 и L2
+    def load_binary(path):
+        return imread(path) > 0
+
+    img_path = resolve(item.get('image'))
+    if not img_path or not os.path.exists(img_path):
+        return 0
+    s_path = resolve(item.get('spine_mask') or item.get('spines_mask'))
+    h_path = resolve(item.get('shaft_mask'))
+    if not s_path or not h_path or not os.path.exists(s_path) or not os.path.exists(h_path):
+        raise ValueError(f"{name}: manual spine_mask (or spines_mask) and shaft_mask required")
+    spine, shaft = load_binary(s_path), load_binary(h_path)
+    g_path = resolve(item.get('general_mask'))
+    mask = load_binary(g_path) if g_path and os.path.exists(g_path) else spine | shaft
+    if spine.shape != mask.shape or shaft.shape != mask.shape:
+        raise ValueError(f"{name}: manual masks must match the original image shape")
+    area_path = resolve(item.get('area_of_interest'))
+    area = load_binary(area_path) if area_path and os.path.exists(area_path) else None
+    if area is not None:
+        if area.shape != mask.shape:
+            raise ValueError(f"{name}: AOI shape mismatch")
+        mask &= area
+    scale = item.get('scale')
+    crop = foreground_crop(mask, scale, spine_radius_um, neck_radius_um, FINAL_SHAPE)
+    if crop is None:
+        return 0
+    full_shape = mask.shape
+    origin = tuple(part.start for part in crop)
+    # Copies release the full TIFF buffers: views would keep them alive.
+    mask = mask[crop].copy()
+    spine = spine[crop].copy()
+    shaft = shaft[crop].copy()
+    valid = np.ones(mask.shape, dtype=np.uint8) if area is None else area[crop].astype(np.uint8)
+    spine &= valid > 0
+    shaft &= valid > 0
+
     l1_path = os.path.join(preds_stage1_dir, f"{name}_L_dendrite.tif")
     l2_path = os.path.join(preds_stage2_dir, f"{name}_necks.tif")
-    
     if not os.path.exists(l1_path) or not os.path.exists(l2_path):
         print(f"Skipping {name}: L1 or L2 predictions missing.")
         return 0
-        
-    l1_raw = imread(l1_path)
-    l2_raw = imread(l2_path)
-    scale = item.get('scale', None)
-    target_high_res_shape = raw_img.shape
-    # Масштабируем L1 для расчета j0
-    # if scale:
-    #     l1_scaled = scale_image(l1_raw, scale)
-    # else: l1_scaled = l1_raw
-
-    # 3. Базовый снимок и Вычисление Isi
-    i_interim = calculate_interim_image(raw_img, scale)
-    l1_bin = (l1_raw > 0.5).astype(np.uint8)
-    j0 = find_optimal_j0(i_interim, l1_bin)
-    I_si = calculate_isi(i_interim, j0)
-
-    l1_up = scale_to_shape(l1_raw, target_high_res_shape)
-    l2_up = scale_to_shape(l2_raw, target_high_res_shape)
-    isi_up = scale_to_shape(I_si, target_high_res_shape)
-    l1_s = apply_gaussian_3d_stack(l1_up, sigma=2.0)
-    l2_s = l2_up.astype(np.float32)  # Preserve thin stage2 neck probabilities.
-    isi_s = apply_gaussian_3d_stack(isi_up, sigma=2.0)
-
-    I_norm = normalize_minmax(raw_img)
-
-    # 5. Загрузка масок
-    g_path = resolve(item.get('general_mask'))
-    s_path = resolve(item.get('spine_mask') or item.get('spines_mask'))
-    h_path = resolve(item.get('shaft_mask'))
-
-    mask = None
-    if g_path and os.path.exists(g_path): mask = imread(g_path)
-    elif s_path and h_path and os.path.exists(s_path) and os.path.exists(h_path):
-        s_mask, h_mask = imread(s_path), imread(h_path)
-        mask = np.maximum(s_mask, h_mask) 
-
-    if mask is None:
-        raise ValueError(f"{name}: general_mask or spine_mask + shaft_mask required")
-    if not s_path or not h_path or not os.path.exists(s_path) or not os.path.exists(h_path):
-        raise ValueError(f"{name}: manual spine_mask (or spines_mask) and shaft_mask required")
-    spine, shaft = imread(s_path) > 0, imread(h_path) > 0
-    if mask.shape != raw_img.shape or spine.shape != raw_img.shape or shaft.shape != raw_img.shape:
+    raw_img = imread(img_path)
+    if raw_img.shape != full_shape:
         raise ValueError(f"{name}: manual masks must match the original image shape")
-    valid = np.ones(raw_img.shape, dtype=np.uint8) if area is None else area
-    mask = ((mask > 0) & (valid > 0)).astype(np.uint8)
-    local_maps = build_local_targets(mask, spine & (valid > 0), shaft & (valid > 0),
-                                     scale, spine_radius_um, neck_radius_um)
-    local_maps['valid_mask'] = valid.astype(np.uint8)
+    if area is not None:
+        raw_img *= area
+    del area
+    l1_raw = imread(l1_path)
+    # Global intensity statistics, resizing, j0 and normalization stay unchanged.
+    # Cropping before these would shift the train/inference input distribution.
+    i_interim = calculate_interim_image(raw_img, scale)
+    j0 = find_optimal_j0(i_interim, (l1_raw > 0.5).astype(np.uint8))
+    I_si = calculate_isi(i_interim, j0)
+    del i_interim
+    minimum, maximum = np.min(raw_img), np.max(raw_img)
+    I_s = (((raw_img[crop] - minimum) / (maximum - minimum)).astype(np.float32)
+           if maximum > minimum else np.zeros(mask.shape, dtype=np.float32))
+    del raw_img
 
-    # 6. Паддинг
-    I_s = pad_to_min_shape(I_norm)
-    l1_s = pad_to_min_shape(l1_s)
-    l2_s = pad_to_min_shape(l2_s)
-    isi_s = pad_to_min_shape(isi_s)
-    mask = pad_to_min_shape(mask)
+    def prepare_aux(volume, smooth):
+        up = scale_to_shape(volume, full_shape)
+        del volume
+        # Keep XY Gaussian context so the retained crop equals full-image smoothing.
+        if smooth:
+            halo = 8  # scipy Gaussian truncate=4, sigma=2
+            expanded = (crop[0], slice(max(0, crop[1].start - halo), min(full_shape[1], crop[1].stop + halo)),
+                        slice(max(0, crop[2].start - halo), min(full_shape[2], crop[2].stop + halo)))
+            local = up[expanded].astype(np.float32, copy=True)
+            del up
+            filtered = apply_gaussian_3d_stack(local, sigma=2.0)
+            del local
+            interior = (slice(None), slice(crop[1].start - expanded[1].start, crop[1].stop - expanded[1].start),
+                        slice(crop[2].start - expanded[2].start, crop[2].stop - expanded[2].start))
+            return filtered[interior].copy()
+        return up[crop].astype(np.float32, copy=True)
+
+    l1_s = prepare_aux(l1_raw, True)
+    del l1_raw
+    isi_s = prepare_aux(I_si, True)
+    del I_si
+    l2_s = prepare_aux(imread(l2_path), False)
+    print(f"{name}: crop {full_shape} -> {mask.shape}, origin={origin}", flush=True)
+    # EDT and skeletonization now see only the foreground crop and physical halo.
+    local_maps = build_local_targets(mask, spine, shaft, scale, spine_radius_um, neck_radius_um)
+    del spine, shaft
+    local_maps['valid_mask'] = valid
+    del valid
+    I_s, l1_s, l2_s, isi_s = (pad_to_min_shape(v) for v in (I_s, l1_s, l2_s, isi_s))
+    mask = pad_to_min_shape(mask.astype(np.uint8))
     local_maps = {key: pad_to_min_shape(value) for key, value in local_maps.items()}
-
-    # 7. Нарезка и Аугментация
     angles = random.sample(ANGLES_POOL, ANGLES_COUNT_TRAIN) if is_train_mode else [0]
     total_saved = 0
-    
     for angle in angles:
-        if angle != 0:
-            img_rot = rotate(I_s, angle, axes=(2, 1), reshape=True, order=1)
-            l1_rot = rotate(l1_s, angle, axes=(2, 1), reshape=True, order=1)
-            l2_rot = rotate(l2_s, angle, axes=(2, 1), reshape=True, order=1)
-            isi_rot = rotate(isi_s, angle, axes=(2, 1), reshape=True, order=1)
-            mask_rot = rotate(mask, angle, axes=(2, 1), reshape=True, order=0)
-        else:
-            img_rot, l1_rot, l2_rot, isi_rot, mask_rot = I_s, l1_s, l2_s, isi_s, mask
-            
-        # Rotate precomputed full-volume skeleton/regions together with GT, not per tile.
-        maps_rot = {key: rotate(value, angle, axes=(2, 1), reshape=True, order=0,
-                                prefilter=False) if angle != 0 else value
-                    for key, value in local_maps.items()}
         for pos in POSITIONS:
-            if not is_train_mode and pos != [0,0,0]: continue
-            saved = split_and_save(img_rot, l1_rot, l2_rot, isi_rot, mask_rot, name, angle, pos, volume_output_dir, maps_rot)
-            total_saved += saved
-            
+            if not is_train_mode and pos != [0, 0, 0]:
+                continue
+            total_saved += split_and_save(I_s, l1_s, l2_s, isi_s, mask, name, angle, pos,
+                                          volume_output_dir, local_maps, origin)
     return total_saved
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -251,12 +241,16 @@ if __name__ == "__main__":
     parser.add_argument("--l2_dir", required=True, help="Путь к предсказаниям L2 (Шейки/Дендриты)")
     parser.add_argument("--mode", required=True, choices=["train", "val", "test"])
     parser.add_argument("--base_path", default="../../")
-    parser.add_argument("--workers", type=int, default=cpu_count()) 
+    parser.add_argument("--workers", type=int, default=min(2, cpu_count()))
     parser.add_argument('--spine_radius_um', type=float, default=0.3)
     parser.add_argument('--neck_radius_um', type=float, default=0.15)
     parser.add_argument('--local_masks_json', help='Stage4 JSON with manual spine_mask and shaft_mask, matched by name')
     parser.add_argument('--local_masks_base_path', help='Base directory for paths in local_masks_json; defaults to base_path')
+    parser.add_argument('--maxtasksperchild', type=int, default=1,
+                        help='Recycle worker after this many images to return memory to OS')
     args = parser.parse_args()
+    if args.workers < 1 or args.maxtasksperchild < 1:
+        parser.error('workers and maxtasksperchild must be >= 1')
     
     final_output_dir = os.path.join(args.out_dir, args.mode)
     os.makedirs(final_output_dir, exist_ok=True)
@@ -293,7 +287,7 @@ if __name__ == "__main__":
     )
     
     total_patches = 0
-    with Pool(processes=args.workers) as pool:
+    with Pool(processes=args.workers, maxtasksperchild=args.maxtasksperchild) as pool:
         for count in tqdm(pool.imap_unordered(worker_func, items), total=len(items)):
             total_patches += count
     print(f" Generated {total_patches} patches (128x128x64) for Stage 3.")

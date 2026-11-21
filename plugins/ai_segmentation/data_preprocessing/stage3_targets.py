@@ -28,6 +28,7 @@ def build_local_targets(mask, spine, shaft, scale, spine_radius_um=0.6, neck_rad
         transition = mask & near_spine & near_shaft
         neck_roi = (distance_transform_edt(~transition, sampling=spacing) <= neck_radius_um
                     if transition.any() else empty.astype(bool))
+        del near_shaft, transition
     else:
         neck_roi = empty.astype(bool)
     local = near_spine | neck_roi
