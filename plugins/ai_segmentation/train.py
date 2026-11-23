@@ -16,12 +16,14 @@ def main(cfg: DictConfig):
     # 2. Init Model
     model = hydra.utils.instantiate(cfg.model)
 
+    is_stage3 = cfg.model._target_ == "src.models.stage3_module.Stage3SegmentationModule"
     checkpoint = ModelCheckpoint(
         dirpath=cfg.paths.checkpoint_dir, 
         monitor="val/loss", 
         mode="min", 
         save_top_k=2,#сколько лучших эпох сохранить
-        save_last=True,#сохранять ли последнюю эпоху
+        save_last=False,
+        save_weights_only=True,
         filename="epoch={epoch:02d}-val_loss={val/loss:.4f}",
         auto_insert_metric_name=False
     )
@@ -29,16 +31,25 @@ def main(cfg: DictConfig):
     callbacks = [checkpoint]
     # Stage3 keeps independent rankings: loss for historical comparisons,
     # Dice for selecting segmentation quality on validation data.
-    if cfg.model._target_ == "src.models.stage3_module.Stage3SegmentationModule":
+    if is_stage3:
         callbacks.append(ModelCheckpoint(
             dirpath=cfg.paths.checkpoint_dir,
             monitor="val/dice",
             mode="max",
             save_top_k=2,
             save_last=False,
+            save_weights_only=True,
             filename="epoch={epoch:02d}-val_dice={val/dice:.4f}",
             auto_insert_metric_name=False,
         ))
+    # All models keep one full checkpoint for resuming training.
+    # A separate callback is needed: save_weights_only also applies to last.ckpt.
+    callbacks.append(ModelCheckpoint(
+        dirpath=cfg.paths.checkpoint_dir,
+        save_top_k=0,
+        save_last=True,
+        save_weights_only=False,
+    ))
     logger = TensorBoardLogger(cfg.paths.log_dir, 
         name="folds",
         version=f"fold_{cfg.paths.fold}")
