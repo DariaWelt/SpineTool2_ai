@@ -35,32 +35,49 @@ class Stage3SegmentationModule(pl.LightningModule):
     def forward(self, x):
         return self.net(x)
 
-    def calculate_loss(self, logits, batch):
-        losses, ps, ts = [], [], []
+    def transfer_batch_to_device(self, batch, device, dataloader_idx):
+        # Slice coordinates are Python metadata; reading CUDA scalars would synchronize.
+        tensors = {key: value for key, value in batch.items() if key != 'borders'}
+        transferred = super().transfer_batch_to_device(tensors, device, dataloader_idx)
+        if 'borders' in batch:
+            transferred['borders'] = batch['borders']
+        return transferred
+
+    def calculate_loss(self, logits, batch, collect_predictions=True):
+        losses, ps, ts, present = [], [], [], []
         parts = {key: [] for key in ('dice', 'bce', 'skeleton')}
         for i in range(logits.shape[0]):
             slices = tuple(slice(int(a), int(b)) for a, b in batch['borders'][i])
             region = (slice(i, i + 1), slice(None), *slices)
             target = batch['mask'][region]
             valid = batch['valid_mask'][region] > 0
-            if not valid.any():
-                continue
+            present.append(valid.any().float())
             loss, components = self.loss_fn(
                 logits[region], target, batch['spine_roi'][region],
-                batch['neck_roi'][region], batch['local_skeleton'][region], valid)
+                batch['neck_roi'][region], batch['local_skeleton'][region], valid,
+                allow_empty=True)
             losses.append(loss)
             for key in parts:
                 parts[key].append(components[key])
-            ps.append(torch.sigmoid(logits[region].float())[valid])
-            ts.append(target[valid])
-        if not losses:
+            if collect_predictions:
+                ps.append(torch.sigmoid(logits[region].detach().float())[valid])
+                ts.append(target[valid])
+        present = torch.stack(present)
+        count = present.sum()
+        if count.is_cuda:
+            torch._assert_async(count > 0)
+        elif not count:
             raise ValueError('Stage3 batch contains no valid annotated voxels')
-        return (torch.stack(losses).mean(), torch.cat(ps), torch.cat(ts),
-                {k: torch.stack(v).mean() for k, v in parts.items()})
+        def mean_valid(values):
+            return (torch.stack(values) * present).sum() / count.clamp_min(1)
+        return (mean_valid(losses), torch.cat(ps) if collect_predictions else None,
+                torch.cat(ts) if collect_predictions else None,
+                {k: mean_valid(v) for k, v in parts.items()})
 
     def _shared_step(self, batch, phase):
         logits = self(batch['image'])
-        loss, p_valid, t_valid, parts = self.calculate_loss(logits, batch)
+        loss, p_valid, t_valid, parts = self.calculate_loss(
+            logits, batch, collect_predictions=phase == 'val')
         self.log(f'{phase}/loss', loss, prog_bar=True, on_step=False, on_epoch=True,
                  batch_size=logits.shape[0])
         for key, value in parts.items():

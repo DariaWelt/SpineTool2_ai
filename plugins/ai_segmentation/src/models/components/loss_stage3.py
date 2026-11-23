@@ -18,31 +18,37 @@ class Stage3Loss(nn.Module):
         self.spine_error_weight = spine_error_weight
         self.neck_error_weight = neck_error_weight
 
-    def forward(self, logits, target, spine_roi, neck_roi, skeleton, valid):
+    def forward(self, logits, target, spine_roi, neck_roi, skeleton, valid, allow_empty=False):
         # Float32 reductions/BCE also under mixed precision; no hard prediction thresholds.
         logits, target = logits.float(), target.float()
         valid = valid.bool()
-        if not valid.any():
-            raise ValueError('Loss requires at least one valid voxel')
-        p, y = logits.sigmoid()[valid], target[valid]
+        if not allow_empty:
+            if valid.is_cuda:
+                torch._assert_async(valid.any())
+            elif not valid.any():
+                raise ValueError('Loss requires at least one valid voxel')
+        # Dense masked reductions avoid CUDA nonzero/boolean-index synchronization.
+        p = logits.sigmoid() * valid
+        y = target * valid
         dice = 1 - (2 * (p * y).sum() + 1) / (p.square().sum() + y.square().sum() + 1)
         voxel_weight = torch.ones_like(target)
         voxel_weight = torch.where(spine_roi > 0, self.spine_error_weight, voxel_weight)
         voxel_weight = torch.where(neck_roi > 0,
                                    torch.maximum(voxel_weight, voxel_weight.new_tensor(self.neck_error_weight)),
                                    voxel_weight)
-        voxel_weight = voxel_weight[valid]
-        errors = F.binary_cross_entropy_with_logits(logits[valid], y, reduction='none')
+        errors = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
         # Equal contribution of foreground/background when both exist. Each region is
         # normalized by its OWN weight sum; background volume cannot drown out necks.
-        terms = []
-        for selected in (y > 0.5, y <= 0.5):
-            if selected.any():
-                w = voxel_weight[selected]
-                terms.append((errors[selected] * w).sum() / w.sum())
-        bce = torch.stack(terms).mean()
+        terms, present = [], []
+        for selected in ((target > 0.5) & valid, (target <= 0.5) & valid):
+            w = voxel_weight * selected
+            weight_sum = w.sum()
+            terms.append((errors * w).sum() / weight_sum.clamp_min(1))
+            present.append((weight_sum > 0).float())
+        bce = torch.stack(terms).sum() / torch.stack(present).sum().clamp_min(1)
         sk = (skeleton > 0) & valid & (target > 0.5)
         # Empty local skeleton contributes zero, not an undefined division.
-        skeleton_loss = 1 - logits.sigmoid()[sk].mean() if sk.any() else logits[valid].sum() * 0
+        sk_count = sk.sum()
+        skeleton_loss = (sk_count > 0).float() - (p * sk).sum() / sk_count.clamp_min(1)
         total = sum(w * v for w, v in zip(self.weights, (dice, bce, skeleton_loss)))
         return total, dict(dice=dice, bce=bce, skeleton=skeleton_loss)
