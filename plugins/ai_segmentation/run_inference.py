@@ -262,7 +262,13 @@ def _run_stage3(request: dict[str, Any], device: str, stage: int) -> np.ndarray:
         stage,
     )
     _emit_progress(stage, 92, "stage " + str(stage) + ": normalize probability")
-    return _normalize_probability(stitched)
+    probability = _normalize_probability(stitched)
+    # ROI selects intersecting patches, but their predictions also cover voxels
+    # outside it. Keep the saved probability restricted to the same ROI.
+    area_mask = datamodule.predict_ds.area_mask
+    if area_mask is not None:
+        probability[..., ~area_mask] = 0.0
+    return probability
 
 
 def _run_stage4(request: dict[str, Any], device: str, stage: int) -> np.ndarray:

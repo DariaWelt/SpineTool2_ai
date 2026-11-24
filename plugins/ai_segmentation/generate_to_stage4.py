@@ -37,6 +37,20 @@ def main(cfg):
     BASE_PATH = "" # базовый путь к картинкам
     OUT_DIR = "D:/shteinberg/9009/ai_segm/stage4/pred_image_f_s2_08s"
     OUT_DIR_bin = "D:/shteinberg/9009/ai_segm/stage4/bin_pred_image_f_s2_08s"
+    # Optional Hydra CLI overrides
+    inference = cfg.get("inference", {})
+    JSON_PATH = inference.get("json_path", JSON_PATH)
+    L1_DIR = inference.get("l1_dir", L1_DIR)
+    L2_DIR = inference.get("l2_dir", L2_DIR)
+    BASE_PATH = inference.get("base_path", BASE_PATH)
+    OUT_DIR = inference.get("out_dir", OUT_DIR)
+    OUT_DIR_bin = inference.get("out_dir_bin", OUT_DIR_bin)
+    split = inference.get("split", "test_data")
+    threshold = float(inference.get("threshold", 0.3))
+    if split not in ("test_data", "validation_data"):
+        raise ValueError("inference.split must be test_data or validation_data")
+    if not 0 <= threshold <= 1:
+        raise ValueError("inference.threshold must be between 0 and 1")
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(OUT_DIR_bin, exist_ok=True)
 #1 epoch=16-val_loss=0.1691
@@ -45,18 +59,16 @@ def main(cfg):
 #4 epoch=06-val_loss=0.2857
 #5 epoch=11-val_loss=0.2087
     ckpt = "D:/shteinberg/CVstage3/checkpoints/f_s2_08s/folds5/epoch=11-val_loss=0.2087.ckpt"# -1folds
-    try:#epoch=11-val_loss=0.2600
-        model = Stage3SegmentationModule.load_from_checkpoint(ckpt, weights_only=False)
-    except:
-        print(f"Checkpoint {ckpt} not found, using random weights for test.")
-        return
+    ckpt = inference.get("ckpt", ckpt)
+    print(f"Checkpoint: {ckpt}\nSplit: {split}\nJSON: {JSON_PATH}", flush=True)
+    model = Stage3SegmentationModule.load_from_checkpoint(ckpt, weights_only=False)
     
     trainer = pl.Trainer(accelerator="gpu", devices=1, logger=True, strategy="auto", precision="16-mixed")
 
 
     with open(JSON_PATH, 'r') as f:
         config = json.load(f)
-    ts = set(config.get('test_data', []))
+    ts = set(config[split])
     for item in config['data']:
         name = item['name']
         if name not in ts: continue
@@ -160,7 +172,7 @@ def main(cfg):
         # block_size = (11, 33, 33) 
         # local_thresh = threshold_local(prob_map, block_size=block_size, offset=0.01)
         # binary = prob_map > local_thresh 
-        binary = (prob_map > 0.3).astype(np.uint8) * 255
+        binary = (prob_map > threshold).astype(np.uint8) * 255
 
         out_file = os.path.join(OUT_DIR, f"{name}_final.tif")
         imwrite(out_file, prob_map.astype(np.float32))
