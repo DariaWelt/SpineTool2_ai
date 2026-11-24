@@ -166,7 +166,11 @@ def main(cfg):
 
         counts[counts == 0] = 1
 
-        prob_map = (full / counts).squeeze().numpy()
+        prob_map = (full / counts)[0].numpy()
+        # Intersecting patches also predict outside ROI; clip before saving
+        # probabilities and deriving the binary mask for stage4.
+        if dm.predict_ds.area_mask is not None:
+            prob_map[~dm.predict_ds.area_mask] = 0.0
 
         # from skimage.filters import threshold_local
         # block_size = (11, 33, 33) 
