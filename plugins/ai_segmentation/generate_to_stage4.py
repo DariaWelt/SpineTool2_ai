@@ -39,6 +39,7 @@ def main(cfg):
     OUT_DIR_bin = "D:/shteinberg/9009/ai_segm/stage4/bin_pred_image_f_s2_08s"
     # Optional Hydra CLI overrides
     inference = cfg.get("inference", {})
+    cfg.datamodule.num_workers = int(inference.get("num_workers", 0))
     JSON_PATH = inference.get("json_path", JSON_PATH)
     L1_DIR = inference.get("l1_dir", L1_DIR)
     L2_DIR = inference.get("l2_dir", L2_DIR)
